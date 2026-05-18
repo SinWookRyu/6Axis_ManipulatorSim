@@ -41,8 +41,8 @@ class ManipulatorApp:
     """Top-level application class."""
 
     # Base speeds (per update tick at ~30 fps)
-    _BASE_TRANS_MM = 2.0   # mm per tick at speed=1.0
-    _BASE_ROT_DEG  = 1.0   # deg per tick at speed=1.0
+    _BASE_TRANS_MM = 5.0   # mm per tick at speed=1.0
+    _BASE_ROT_DEG  = 2.0   # deg per tick at speed=1.0
     _UPDATE_MS     = 33    # ~30 fps
 
     # Key → action mapping
@@ -60,12 +60,22 @@ class ManipulatorApp:
         self.dh_params = dh_params
 
         self.joint_angles = np.zeros(len(dh_params))
-        self.speed_var = tk.DoubleVar(value=1.0)
+        self.speed_var = tk.DoubleVar(value=2.0)
         self.external_wrench = np.zeros(6)
         self.active_keys: set = set()
 
+        # 3D view state
+        self._zoom_factor = 1.0
+        self._view_elev = 20.0
+        self._view_azim = -60.0
+        self._rotate_start = None
+
+        # Guard against feedback loop when updating world sliders programmatically
+        self._world_slider_updating = False
+
         self._sing_detector = SingularityDetector()
         self._workspace_pts: np.ndarray | None = None
+        self._workspace_rings: list | None = None   # pre-computed cross-section contours
         self._show_workspace = False
         self._workspace_busy = False
 
@@ -115,7 +125,6 @@ class ManipulatorApp:
 
         # Status bar
         self._status_var = tk.StringVar(value="Ready")
-        self._status_color = tk.StringVar(value=OK_COL)
         sf = tk.Frame(self.root, bg=PANEL_BG, height=24)
         sf.pack(fill=tk.X, side=tk.BOTTOM)
         self._status_lbl = tk.Label(
@@ -131,7 +140,7 @@ class ManipulatorApp:
         pane.pack(fill=tk.BOTH, expand=True)
 
         view_frame = ttk.Frame(pane)
-        ctrl_frame = ttk.Frame(pane, width=290)
+        ctrl_frame = ttk.Frame(pane, width=300)
         pane.add(view_frame,  weight=4)
         pane.add(ctrl_frame,  weight=1)
 
@@ -148,8 +157,12 @@ class ManipulatorApp:
         widget.pack(fill=tk.BOTH, expand=True)
         widget.configure(bg=BG)
 
-        # Give focus back to root on canvas click so key bindings work
-        widget.bind("<Button-1>", lambda e: self.root.focus_set())
+        # Mouse bindings for 3D view
+        widget.bind("<Button-1>",        lambda e: self.root.focus_set())
+        widget.bind("<MouseWheel>",      self._on_canvas_scroll)
+        widget.bind("<Button-2>",        self._on_middle_press)
+        widget.bind("<B2-Motion>",       self._on_middle_drag)
+        widget.bind("<ButtonRelease-2>", self._on_middle_release)
 
         toolbar_frame = tk.Frame(parent, bg=BG)
         toolbar_frame.pack(fill=tk.X)
@@ -177,6 +190,7 @@ class ManipulatorApp:
         canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._ctrl_canvas = canvas
 
         inner = ttk.Frame(canvas)
         canvas_window = canvas.create_window((0, 0), window=inner, anchor="nw")
@@ -190,13 +204,15 @@ class ManipulatorApp:
         canvas.bind("<Configure>", on_canvas_configure)
 
         p = 4
+
         # ── Keyboard shortcuts help ─
         kf = ttk.LabelFrame(inner, text="Keyboard Control (EE Space)", padding=p)
         kf.pack(fill=tk.X, pady=3, padx=4)
         help_text = (
             "A/D  → X-/+    W/S  → Y+/-\n"
             "R/F  → Z+/-    Q/E  → Roll-/+\n"
-            "I/K  → Pitch+/−  J/L  → Yaw-/+"
+            "I/K  → Pitch+/−  J/L  → Yaw-/+\n"
+            "휠 스크롤: 3D 줌  /  휠 클릭 드래그: 회전"
         )
         tk.Label(kf, text=help_text, bg=PANEL_BG, fg="#a6adc8",
                  font=("Consolas", 8), justify=tk.LEFT).pack(anchor=tk.W)
@@ -236,18 +252,40 @@ class ManipulatorApp:
             val_lbl = ttk.Label(row, textvariable=var, width=8)
             val_lbl.pack(side=tk.RIGHT)
 
-        # ── World space ─
-        wf = ttk.LabelFrame(inner, text="World Space (EE Pose)", padding=p)
+        # ── World space (interactive sliders + IK) ─
+        wf = ttk.LabelFrame(inner, text="World Space — 슬라이더로 EE 위치 조정", padding=p)
         wf.pack(fill=tk.X, pady=3, padx=4)
         self._world_vars = {}
-        for label in ("X(mm)", "Y(mm)", "Z(mm)", "Roll(°)", "Pitch(°)", "Yaw(°)"):
+        self._world_sliders = {}
+
+        reach = sum(abs(j.a) + abs(j.d) for j in self.dh_params.joints)
+        world_configs = [
+            ("X(mm)",    -reach,        reach,  1.0),
+            ("Y(mm)",    -reach,        reach,  1.0),
+            ("Z(mm)",    -reach * 0.2,  reach,  1.0),
+            ("Roll(°)",  -180,          180,    0.5),
+            ("Pitch(°)", -180,          180,    0.5),
+            ("Yaw(°)",   -180,          180,    0.5),
+        ]
+        for label, from_, to_, res in world_configs:
             row = ttk.Frame(wf)
             row.pack(fill=tk.X, pady=1)
             ttk.Label(row, text=f"{label}:", width=8).pack(side=tk.LEFT)
-            v = tk.StringVar(value="0.000")
+            v = tk.DoubleVar(value=0.0)
             self._world_vars[label] = v
-            ttk.Label(row, textvariable=v, foreground=ACCENT,
-                      font=("Consolas", 9)).pack(side=tk.LEFT)
+            sl = tk.Scale(
+                row, variable=v, orient=tk.HORIZONTAL,
+                from_=from_, to=to_, resolution=res,
+                bg=PANEL_BG, fg=FG, highlightthickness=0,
+                troughcolor="#313244", activebackground=ACCENT,
+                showvalue=False,
+                command=lambda val, lbl=label: self._on_world_slider(lbl, float(val)),
+            )
+            sl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self._world_sliders[label] = sl
+            val_lbl = ttk.Label(row, textvariable=v, width=9,
+                                font=("Consolas", 9), foreground=ACCENT)
+            val_lbl.pack(side=tk.RIGHT)
 
         # ── External force/torque ─
         ef = ttk.LabelFrame(inner, text="External Wrench at EE", padding=p)
@@ -268,7 +306,6 @@ class ManipulatorApp:
         tf = ttk.LabelFrame(inner, text="Joint Torques (N·m / %rated)", padding=p)
         tf.pack(fill=tk.X, pady=3, padx=4)
         self._torque_vars = []
-        self._torque_bars = []
         for i in range(len(self.dh_params.joints)):
             row = ttk.Frame(tf)
             row.pack(fill=tk.X, pady=1)
@@ -299,8 +336,18 @@ class ManipulatorApp:
         bf.pack(fill=tk.X, pady=6, padx=4)
         ttk.Button(bf, text="Reset Home", command=self._reset_home).pack(
             side=tk.LEFT, padx=2)
-        ttk.Button(bf, text="Zero Joints", command=self._zero_joints).pack(
+        ttk.Button(bf, text="All Joints = 0°", command=self._zero_joints).pack(
             side=tk.LEFT, padx=2)
+
+        # Bind mouse wheel scroll to all children so panel scrolls on hover
+        self._bind_ctrl_scroll_recursive(inner)
+        canvas.bind("<MouseWheel>", self._on_ctrl_scroll)
+
+    def _bind_ctrl_scroll_recursive(self, widget):
+        """Bind scroll to all descendants so the panel scrolls, not individual sliders."""
+        widget.bind("<MouseWheel>", self._on_ctrl_scroll)
+        for child in widget.winfo_children():
+            self._bind_ctrl_scroll_recursive(child)
 
     # ── DH parameters tab ───────────────────────────────────────────────────
 
@@ -366,6 +413,43 @@ class ManipulatorApp:
             self.active_keys.discard(self._KEY_MAP[key])
 
     # -----------------------------------------------------------------------
+    # 3D view mouse interaction
+    # -----------------------------------------------------------------------
+
+    def _on_canvas_scroll(self, event):
+        """Mouse wheel over 3D view → zoom in/out."""
+        if event.delta > 0:
+            self._zoom_factor *= 1.15
+        else:
+            self._zoom_factor /= 1.15
+        self._zoom_factor = float(np.clip(self._zoom_factor, 0.1, 10.0))
+        self._redraw()
+        return "break"
+
+    def _on_middle_press(self, event):
+        self._rotate_start = (event.x, event.y)
+
+    def _on_middle_drag(self, event):
+        """Middle-click drag → orbit the 3D view."""
+        if self._rotate_start is None:
+            return
+        dx = event.x - self._rotate_start[0]
+        dy = event.y - self._rotate_start[1]
+        self._rotate_start = (event.x, event.y)
+        self._view_azim -= dx * 0.5
+        self._view_elev = float(np.clip(self._view_elev + dy * 0.3, -89, 89))
+        self._ax.view_init(elev=self._view_elev, azim=self._view_azim)
+        self._canvas.draw_idle()
+
+    def _on_middle_release(self, event):
+        self._rotate_start = None
+
+    def _on_ctrl_scroll(self, event):
+        """Mouse wheel over control panel → scroll the panel."""
+        self._ctrl_canvas.yview_scroll(-1 * (event.delta // 120), "units")
+        return "break"
+
+    # -----------------------------------------------------------------------
     # Update loop
     # -----------------------------------------------------------------------
 
@@ -418,10 +502,35 @@ class ManipulatorApp:
             self._update_state_displays()
 
     def _on_joint_slider(self, idx: int, deg_val: float):
-        """Called when a joint slider is moved directly."""
+        """Called when a joint slider is moved by the user."""
         self.joint_angles[idx] = np.radians(deg_val)
         self._redraw()
         self._update_state_displays()
+
+    def _on_world_slider(self, label: str, val: float):
+        """Called when a world-space slider is dragged; runs IK to update joints."""
+        if self._world_slider_updating:
+            return
+
+        _, T_ee = forward_kinematics(self.dh_params, self.joint_angles)
+        T_target = T_ee.copy()
+
+        pos_map = {"X(mm)": 0, "Y(mm)": 1, "Z(mm)": 2}
+        rot_map = {"Roll(°)": 0, "Pitch(°)": 1, "Yaw(°)": 2}
+
+        if label in pos_map:
+            T_target[pos_map[label], 3] = val
+        elif label in rot_map:
+            rpy = list(rotation_matrix_to_rpy(T_ee[:3, :3]))
+            rpy[rot_map[label]] = np.radians(val)
+            T_target[:3, :3] = rpy_to_rotation_matrix(*rpy)
+
+        q_new, success, err = ik_fast(self.dh_params, T_target, q_init=self.joint_angles)
+        if success or err < 10.0:
+            self.joint_angles = q_new
+            self._sync_sliders()
+            self._redraw()
+            self._update_state_displays()
 
     # -----------------------------------------------------------------------
     # 3D rendering
@@ -429,20 +538,44 @@ class ManipulatorApp:
 
     def _redraw(self):
         ax = self._ax
+        # Sync stored view angles with what matplotlib currently has (toolbar may change them)
+        try:
+            self._view_elev = float(ax.elev)
+            self._view_azim = float(ax.azim)
+        except Exception:
+            pass
+
         ax.cla()
         self._style_axes()
 
         T_list, T_ee = forward_kinematics(self.dh_params, self.joint_angles)
         pts = np.array([T[:3, 3] for T in T_list])
 
-        # Draw workspace points
+        reach = sum(abs(j.a) + abs(j.d) for j in self.dh_params.joints)
+        lim = reach * 0.75 / self._zoom_factor
+
+        # Draw workspace visualisation — 3D grid
         if self._show_workspace and self._workspace_pts is not None:
-            wp = self._workspace_pts
-            step = max(1, len(wp) // 3000)
-            ax.scatter(
-                wp[::step, 0], wp[::step, 1], wp[::step, 2],
-                c="#89b4fa", alpha=0.03, s=1, depthshade=False,
-            )
+            if self._workspace_rings:
+                rings = self._workspace_rings
+                n_rings = len(rings)
+                n_ang = len(rings[0][1]) - 1  # closed ring has n_ang+1 pts
+
+                # ── Horizontal rings (latitude lines) ──
+                for idx, (z_level, ring_xy) in enumerate(rings):
+                    t = idx / max(n_rings - 1, 1)
+                    color = (0.20 + 0.40 * t, 0.55 + 0.25 * t, 0.78 + 0.18 * t)
+                    z_arr = np.full(len(ring_xy), z_level)
+                    ax.plot(ring_xy[:, 0], ring_xy[:, 1], z_arr,
+                            color=color, linewidth=0.8, alpha=0.75, zorder=2)
+
+                # ── Vertical lines (meridian lines) ──
+                for ang_idx in range(n_ang):
+                    xs = [r[1][ang_idx, 0] for r in rings]
+                    ys = [r[1][ang_idx, 1] for r in rings]
+                    zs = [r[0] for r in rings]
+                    ax.plot(xs, ys, zs,
+                            color="#5a9fd4", linewidth=0.7, alpha=0.50, zorder=2)
 
         # Draw base platform
         cx, cy = pts[0, 0], pts[0, 1]
@@ -479,12 +612,31 @@ class ManipulatorApp:
                 color=col, linewidth=2.0, arrow_length_ratio=0.25,
             )
 
-        # Axes limits based on max reach
-        reach = sum(abs(j.a) + abs(j.d) for j in self.dh_params.joints)
-        lim = reach * 0.75
+        # External force/torque arrows at EE
+        force  = self.external_wrench[:3]
+        torque = self.external_wrench[3:]
+        f_mag = np.linalg.norm(force)
+        if f_mag > 0.01:
+            arrow_len = min(lim * 0.35, 15.0 * f_mag)
+            f_dir = force / f_mag
+            ax.quiver(*p_ee, *(f_dir * arrow_len),
+                      color="#ff4444", linewidth=2.5, arrow_length_ratio=0.3)
+            tip = p_ee + f_dir * arrow_len * 1.12
+            ax.text(*tip, f"F={f_mag:.1f}N", color="#ff4444", fontsize=7)
+        t_mag = np.linalg.norm(torque)
+        if t_mag > 0.01:
+            arrow_len = min(lim * 0.3, 10.0 * t_mag)
+            t_dir = torque / t_mag
+            ax.quiver(*p_ee, *(t_dir * arrow_len),
+                      color="#ffaa00", linewidth=2.5, arrow_length_ratio=0.3)
+            tip = p_ee + t_dir * arrow_len * 1.12
+            ax.text(*tip, f"M={t_mag:.1f}Nm", color="#ffaa00", fontsize=7)
+
+        # Axes limits and view
         ax.set_xlim(-lim, lim)
         ax.set_ylim(-lim, lim)
-        ax.set_zlim(0, reach * 1.1)
+        ax.set_zlim(0, reach * 1.1 / self._zoom_factor)
+        ax.view_init(elev=self._view_elev, azim=self._view_azim)
 
         self._canvas.draw_idle()
 
@@ -503,8 +655,12 @@ class ManipulatorApp:
         rpy = np.degrees(rotation_matrix_to_rpy(T_ee[:3, :3]))
         keys = ("X(mm)", "Y(mm)", "Z(mm)", "Roll(°)", "Pitch(°)", "Yaw(°)")
         vals = list(p) + list(rpy)
-        for k, v in zip(keys, vals):
-            self._world_vars[k].set(f"{v:+.3f}")
+        self._world_slider_updating = True
+        try:
+            for k, v in zip(keys, vals):
+                self._world_vars[k].set(round(float(v), 3))
+        finally:
+            self._world_slider_updating = False
 
     def _update_torque_display(self):
         _, report = joint_load_report(
@@ -523,7 +679,7 @@ class ManipulatorApp:
         self._status_lbl.configure(fg=col)
 
     def _sync_sliders(self):
-        """Sync slider positions to current joint_angles (without triggering callbacks)."""
+        """Sync joint slider positions to current joint_angles."""
         for i, v in enumerate(self._joint_vars):
             v.set(round(np.degrees(self.joint_angles[i]), 2))
 
@@ -552,6 +708,7 @@ class ManipulatorApp:
             self.dh_params = DHParameters(joints=new_joints, name=self.dh_params.name)
             self.joint_angles = np.zeros(len(self.dh_params))
             self._workspace_pts = None
+            self._workspace_rings = None
             self._show_workspace = False
             self._ws_toggle_btn.configure(state=tk.DISABLED, text="Show")
             self._ws_status_var.set("Not computed (DH changed)")
@@ -576,6 +733,7 @@ class ManipulatorApp:
         self.dh_params = DHParameters.fanuc_m10ia()
         self.joint_angles = np.zeros(len(self.dh_params))
         self._workspace_pts = None
+        self._workspace_rings = None
         self._show_workspace = False
         self._ws_toggle_btn.configure(state=tk.DISABLED, text="Show")
         self._ws_status_var.set("Not computed")
@@ -600,6 +758,7 @@ class ManipulatorApp:
             vals = [float(e.get()) for e in self._wrench_entries]
             self.external_wrench = np.array(vals)
             self._update_torque_display()
+            self._redraw()
         except ValueError:
             messagebox.showerror("Input Error", "Enter valid numbers for wrench.")
 
@@ -617,7 +776,9 @@ class ManipulatorApp:
         def worker():
             pts = sample_workspace(self.dh_params, n_samples=25_000)
             stats = workspace_stats(pts)
+            rings = ManipulatorApp._build_workspace_rings(pts)
             self._workspace_pts = pts
+            self._workspace_rings = rings
             self.root.after(0, lambda: self._on_workspace_done(stats))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -639,18 +800,86 @@ class ManipulatorApp:
         )
         self._redraw()
 
+    @staticmethod
+    def _build_workspace_rings(pts: np.ndarray,
+                               n_rings: int = 10,
+                               n_ang: int = 24) -> list:
+        """
+        Pre-compute 3D-grid-ready workspace rings.
+
+        Each ring is resampled to n_ang uniformly-spaced angular points (centred
+        at the robot base origin) so that vertical meridian lines can be drawn by
+        connecting the same angular index across adjacent rings.
+
+        Returns list of (z_level, ring_xy) where ring_xy has shape (n_ang+1, 2)
+        — the last point repeats the first to close the horizontal loop.
+        """
+        from scipy.spatial import ConvexHull
+
+        z_vals = pts[:, 2]
+        z_min, z_max = float(z_vals.min()), float(z_vals.max())
+        z_span = z_max - z_min
+        if z_span < 1.0:
+            return []
+
+        thickness = max(z_span * 0.04, 20.0)
+        z_levels = np.linspace(z_min + z_span * 0.05,
+                               z_max - z_span * 0.05, n_rings)
+
+        # Uniform target angles centred at origin (robot base projection)
+        target_ang = np.linspace(-np.pi, np.pi, n_ang, endpoint=False)
+
+        rings = []
+        for z in z_levels:
+            mask = np.abs(pts[:, 2] - z) < thickness
+            slice_pts = pts[mask]
+            if len(slice_pts) < 8:
+                continue
+            try:
+                h2d = ConvexHull(slice_pts[:, :2])
+                hull_xy = slice_pts[h2d.vertices, :2]
+
+                # Angles of hull vertices from origin
+                angs = np.arctan2(hull_xy[:, 1], hull_xy[:, 0])
+                sort_idx = np.argsort(angs)
+                hull_xy = hull_xy[sort_idx]
+                angs = angs[sort_idx]
+
+                # Extend for wraparound interpolation
+                w = max(1, len(angs) // 4)
+                ang_ext = np.concatenate([angs[-w:] - 2 * np.pi,
+                                          angs,
+                                          angs[:w] + 2 * np.pi])
+                x_ext = np.concatenate([hull_xy[-w:, 0], hull_xy[:, 0], hull_xy[:w, 0]])
+                y_ext = np.concatenate([hull_xy[-w:, 1], hull_xy[:, 1], hull_xy[:w, 1]])
+
+                # Resample at uniform angles
+                x_new = np.interp(target_ang, ang_ext, x_ext)
+                y_new = np.interp(target_ang, ang_ext, y_ext)
+
+                # Closed ring (n_ang + 1 points)
+                ring_xy = np.vstack([
+                    np.column_stack([x_new, y_new]),
+                    [x_new[0], y_new[0]],
+                ])
+                rings.append((float(z), ring_xy))
+            except Exception:
+                continue
+        return rings
+
     # -----------------------------------------------------------------------
     # Reset helpers
     # -----------------------------------------------------------------------
 
     def _reset_home(self):
-        """Move to a typical ready position."""
-        self.joint_angles = np.radians([0, 0, 0, 0, 0, 0])
+        """Move to a typical ready position (all joints at 0°)."""
+        self.joint_angles = np.zeros(len(self.dh_params))
         self._sync_sliders()
         self._redraw()
         self._update_state_displays()
 
     def _zero_joints(self):
+        """Set all joint angles to exactly 0° (DH convention zero position)."""
         self.joint_angles = np.zeros(len(self.dh_params))
         self._sync_sliders()
         self._redraw()

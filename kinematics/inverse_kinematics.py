@@ -27,6 +27,7 @@ def inverse_kinematics_dls(
     tol: float = 1.0,
     lambda_sq: float = 0.01,
     alpha: float = 0.5,
+    ori_tol: float = 0.035,
 ) -> tuple:
     """
     Damped Least Squares (Levenberg–Marquardt) IK solver.
@@ -34,12 +35,13 @@ def inverse_kinematics_dls(
     dq = J^T (J J^T + λ²I)^{-1} δx
 
     Args:
-        tol:       convergence threshold (position error in mm)
-        lambda_sq: fixed damping factor (use adaptive_dls for variable damping)
+        tol:       convergence threshold for position error (mm)
+        ori_tol:   convergence threshold for orientation error (rad, ~2° default)
+        lambda_sq: fixed damping factor
         alpha:     step size scale
 
     Returns:
-        (q, success, final_error_norm)
+        (q, success, final_position_error_norm)
     """
     n = len(dh_params.joints)
     q = np.zeros(n) if q_init is None else np.array(q_init, dtype=float)
@@ -48,8 +50,9 @@ def inverse_kinematics_dls(
         _, T_curr = forward_kinematics(dh_params, q)
         err = pose_error(T_curr, target_T)
         err_norm = np.linalg.norm(err[:3])
+        err_ori  = np.linalg.norm(err[3:])
 
-        if err_norm < tol:
+        if err_norm < tol and err_ori < ori_tol:
             return q, True, err_norm
 
         J = geometric_jacobian(dh_params, q)
@@ -87,5 +90,5 @@ def ik_fast(
     """Fast IK for real-time control: fewer iterations, larger tolerance."""
     return inverse_kinematics_dls(
         dh_params, target_T, q_init=q_init,
-        max_iter=20, tol=2.0, lambda_sq=0.01, alpha=0.8,
+        max_iter=30, tol=2.0, lambda_sq=0.01, alpha=0.8, ori_tol=0.1,
     )
